@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Backrooms - Terror in Three.js</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            width: 100%;
+            height: 100%;
+            background-color: #000;
+            font-family: 'Courier New', Courier, monospace;
+            user-select: none;
+        }
+        #canvas-container { width: 100%; height: 100%; }
+        #crosshair {
+            position: absolute;
+            top: 50%; left: 50%;
+            width: 10px; height: 10px;
+            background-color: transparent;
+            border: 2px solid rgba(255, 255, 255, 0.5);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            z-index: 5;
+        }
+        #blocker {
+            position: absolute; width: 100%; height: 100%;
+            background-color: rgba(0,0,0,0.85);
+            display: flex; flex-direction: column;
+            justify-content: center; align-items: center;
+            color: #ffcc00; z-index: 10; cursor: pointer; text-align: center;
+        }
+        #instructions { font-size: 24px; animation: pulse 2s infinite; }
+        #controls { margin-top: 20px; color: #ccc; font-size: 14px; line-height: 1.6; }
+        #ui-overlay {
+            position: absolute; top: 20px; left: 20px;
+            color: #00ff00; font-size: 14px; z-index: 5;
+            pointer-events: none; background: rgba(0,0,0,0.5);
+            padding: 10px; border-radius: 5px;
+            border: 1px solid #005500;
+            text-shadow: 0 0 5px #005500;
+        }
+        #level-display {
+            position: absolute; top: 20px; right: 20px;
+            color: #ffaa00; font-size: 24px; font-weight: bold;
+            z-index: 5; pointer-events: none;
+        }
+        #jumpscare {
+            position: absolute; top: 0; left: 0;
+            width: 100%; height: 100%; background-color: #000;
+            display: none; z-index: 100; justify-content: center; align-items: center;
+        }
+        #jumpscare-face {
+            width: 100vw; height: 100vh;
+            background: radial-gradient(circle, #ff0000 0%, #220000 40%, #000000 100%);
+            display: flex; justify-content: center; align-items: center;
+            color: #fff; font-size: 120px; font-weight: bold; letter-spacing: 20px;
+            animation: shake 0.1s infinite;
+        }
+        @keyframes pulse { 0% { opacity: 0.6; } 50% { opacity: 1; } 100% { opacity: 0.6; } }
+        @keyframes shake {
+            0% { transform: translate(2px, 1px) rotate(0deg); }
+            50% { transform: translate(-1px, 2px) rotate(-1deg); }
+            100% { transform: translate(1px, -2px) rotate(1deg); }
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+    <div id="crosshair"></div>
+    
+    <div id="ui-overlay">
+        Level: <span id="lvl">0</span><br><br>
+        [LMB] Fire Stun Gun<br>
+        [SHIFT] Sprint<br>
+        [F] Toggle Fly/Noclip<br>
+        [T] Toggle Monster Vision
+    </div>
+
+    <div id="level-display">Find the Green Exit</div>
+
+    <div id="blocker">
+        <div id="instructions">CLICK TO ENTER THE BACKROOMS</div>
+        <div id="controls">
+            WASD = Move | Mouse = Look | Shift = Sprint<br>
+            Left Click = Shoot Stun Gun<br>
+            F = Toggle Noclip/Fly (Space/Ctrl to go Up/Down)<br>
+            Find the green glowing exit to descend deeper.
+        </div>
+    </div>
+
+    <div id="jumpscare">
+        <div id="jumpscare-face">IT CAUGHT YOU</div>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script>
+        // --- GAME STATE ---
+        let scene, camera, renderer, raycaster;
+        let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
+        let isSprinting = false, isFlying = false, moveUp = false, moveDown = false;
+        let prevTime = performance.now();
+        const camDir = new THREE.Vector3(); 
+        const euler = new THREE.Euler(0, 0, 0, 'YXZ'); 
+        
+        let currentLevel = 0;
+        let MAP_SIZE = 15; // Grows each level
+        const UNIT_SIZE = 4;
+        let map = [];
+        let walls = [];
+        let mobs = [];
+        let exitPortal;
+        let isGameOver = false;
+
+        let flashlight, gunGroup, laserLine;
+        let isMonsterHighlighted = false;
+
+        const container = document.getElementById('canvas-container');
+        const blocker = document.getElementById('blocker');
+
+        // --- CONTROLS ---
+        const menuLoop = {
+            init: function() {
+                blocker.addEventListener('click', () => {
+                    blocker.requestPointerLock();
+                });
+                document.addEventListener('pointerlockchange', () => {
+                    if (document.pointerLockElement === blocker) blocker.style.display = 'none';
+                    else if(!isGameOver) blocker.style.display = 'flex';
+                });
+                document.addEventListener('keydown', onKeyDown);
+                document.addEventListener('keyup', onKeyUp);
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mousedown', onMouseDown);
+            }
+        };
+
+        function init() {
+            scene = new THREE.Scene();
+            // Backrooms yellowish fog
+            scene.background = new THREE.Color(0xd6c689);
+            scene.fog = new THREE.FogExp2(0xd6c689, 0.06); 
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+            scene.add(camera);
+
+            raycaster = new THREE.Raycaster();
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            container.appendChild(renderer.domElement);
+
+            flashlight = new THREE.SpotLight(0xffffee, 3.0, 30, Math.PI / 4, 0.5, 1);
+            flashlight.castShadow = true;
+            scene.add(flashlight);
+            scene.add(flashlight.target);
+
+            const ambient = new THREE.AmbientLight(0x8a7a4a, 0.5); // Nauseating yellow ambient
+            scene.add(ambient);
+
+            buildWeapon();
+            loadLevel();
+
+            window.addEventListener('resize', onWindowResize);
+            menuLoop.init();
+            animate();
+        }
+
+        // --- LEVEL GENERATION ---
+        function loadLevel() {
+            currentLevel++;
+            document.getElementById('lvl').innerText = currentLevel;
+            MAP_SIZE = Math.min(15 + (currentLevel * 4), 41); // Increase size, cap at 41 to prevent lag
+
+            // Clear old level
+            walls.forEach(w => scene.remove(w)); walls = [];
+            mobs.forEach(m => scene.remove(m)); mobs = [];
+            if(exitPortal) scene.remove(exitPortal);
+            
+            // Re-generate maze (Recursive Backtracker)
+            generateMaze();
+            buildMazeGeometry();
+
+            // Spawn player at 1,1
+            camera.position.set(UNIT_SIZE * 1, 1.6, UNIT_SIZE * 1);
+            euler.set(0,0,0);
+            camera.quaternion.setFromEuler(euler);
+
+            // Spawn Mobs
+            let mobCount = Math.min(currentLevel, 10);
+            for(let i=0; i<mobCount; i++) {
+                spawnMonster();
+            }
+
+            // Spawn Exit
+            spawnExit();
+        }
+
+        function generateMaze() {
+            map = Array(MAP_SIZE).fill().map(() => Array(MAP_SIZE).fill(1));
+            function carve(x, z) {
+                map[z][x] = 0;
+                const dirs = [[0,2], [0,-2], [2,0], [-2,0]].sort(() => Math.random() - 0.5);
+                for(let [dx, dz] of dirs) {
+                    let nx = x + dx, nz = z + dz;
+                    if(nx > 0 && nx < MAP_SIZE-1 && nz > 0 && nz < MAP_SIZE-1 && map[nz][nx] === 1) {
+                        map[z + dz/2][x + dx/2] = 0; // Break wall between
+                        carve(nx, nz);
+                    }
+                }
+            }
+            carve(1, 1);
+            // Force start and end points
+            map[1][1] = 0;
+            map[MAP_SIZE-2][MAP_SIZE-2] = 0; 
+        }
+
+        function buildMazeGeometry() {
+            // Backrooms Textures
+            const wallTex = createNoiseTexture('#e8d898', '#c7b777'); // Yellow wallpaper
+            const floorTex = createNoiseTexture('#6e5c3e', '#4f4028'); // Damp carpet
+            
+            const wallGeo = new THREE.BoxGeometry(UNIT_SIZE, 5, UNIT_SIZE);
+            const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 1.0 });
+            
+            const floorGeo = new THREE.PlaneGeometry(MAP_SIZE * UNIT_SIZE, MAP_SIZE * UNIT_SIZE);
+            const floorMat = new THREE.MeshStandardMaterial({ map: floorTex, roughness: 1.0 });
+            
+            const floor = new THREE.Mesh(floorGeo, floorMat);
+            floor.rotation.x = -Math.PI / 2;
+            floor.position.set((MAP_SIZE*UNIT_SIZE)/2 - UNIT_SIZE/2, 0, (MAP_SIZE*UNIT_SIZE)/2 - UNIT_SIZE/2);
+            floor.receiveShadow = true;
+            scene.add(floor);
+
+            for (let r = 0; r < MAP_SIZE; r++) {
+                for (let c = 0; c < MAP_SIZE; c++) {
+                    if (map[r][c] === 1) {
+                        const wall = new THREE.Mesh(wallGeo, wallMat);
+                        wall.position.set(c * UNIT_SIZE, 2.5, r * UNIT_SIZE);
+                        wall.castShadow = true;
+                        wall.receiveShadow = true;
+                        scene.add(wall);
+                        walls.push(wall); 
+                    }
+                }
+            }
+        }
+
+        function spawnExit() {
+            const exitGeo = new THREE.BoxGeometry(UNIT_SIZE - 0.5, 4, UNIT_SIZE - 0.5);
+            const exitMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.5 });
+            exitPortal = new THREE.Mesh(exitGeo, exitMat);
+            exitPortal.position.set((MAP_SIZE-2) * UNIT_SIZE, 2, (MAP_SIZE-2) * UNIT_SIZE);
+            
+            const exitLight = new THREE.PointLight(0x00ff00, 2, 10);
+            exitPortal.add(exitLight);
+            scene.add(exitPortal);
+        }
+
+        // --- MONSTERS ---
+        function spawnMonster() {
+            let monster = new THREE.Group();
+            monster.stunUntil = 0; 
+            
+            const bodyGeo = new THREE.CylinderGeometry(0.4, 0.2, 3.5, 8);
+            const bodyMat = new THREE.MeshBasicMaterial({ color: 0x111111 });
+            const body = new THREE.Mesh(bodyGeo, bodyMat);
+            body.position.y = 1.75;
+            monster.add(body);
+            
+            const headGeo = new THREE.SphereGeometry(0.4, 8, 8);
+            const headMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+            const head = new THREE.Mesh(headGeo, headMat);
+            head.position.y = 3.7;
+            monster.add(head);
+
+            // Find random empty spot
+            let mx, mz;
+            do {
+                mx = Math.floor(Math.random() * (MAP_SIZE - 2)) + 1;
+                mz = Math.floor(Math.random() * (MAP_SIZE - 2)) + 1;
+            } while (map[mz][mx] !== 0 || (mx < 5 && mz < 5)); // Keep away from start
+
+            monster.position.set(mx * UNIT_SIZE, 0, mz * UNIT_SIZE);
+            scene.add(monster);
+            mobs.push(monster);
+        }
+
+        // --- WEAPONS ---
+        function buildWeapon() {
+            gunGroup = new THREE.Group();
+            
+            // Procedural Stun Gun
+            const barrelMat = new THREE.MeshStandardMaterial({color: 0x222222, roughness: 0.4});
+            const barrelGeo = new THREE.BoxGeometry(0.1, 0.1, 0.5);
+            const barrel = new THREE.Mesh(barrelGeo, barrelMat);
+            barrel.position.z = -0.25;
+
+            const handleGeo = new THREE.BoxGeometry(0.1, 0.3, 0.1);
+            const handle = new THREE.Mesh(handleGeo, barrelMat);
+            handle.position.set(0, -0.15, -0.05);
+            handle.rotation.x = Math.PI / 8;
+
+            const nodeMat = new THREE.MeshBasicMaterial({color: 0x00ffff});
+            const node1 = new THREE.Mesh(new THREE.SphereGeometry(0.02), nodeMat);
+            node1.position.set(-0.03, 0.05, -0.5);
+            const node2 = new THREE.Mesh(new THREE.SphereGeometry(0.02), nodeMat);
+            node2.position.set(0.03, 0.05, -0.5);
+
+            gunGroup.add(barrel, handle, node1, node2);
+            gunGroup.position.set(0.3, -0.3, -0.5);
+            camera.add(gunGroup);
+
+            // Laser line for shooting effect
+            const lineMat = new THREE.LineBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0 });
+            const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-10)]);
+            laserLine = new THREE.Line(lineGeo, lineMat);
+            gunGroup.add(laserLine);
+        }
+
+        function onMouseDown(event) {
+            if(document.pointerLockElement !== blocker || isGameOver) return;
+            
+            // Animate Gun Recoil
+            gunGroup.position.z = -0.4;
+            setTimeout(() => gunGroup.position.z = -0.5, 100);
+
+            // Flash Laser
+            laserLine.material.opacity = 1;
+            setTimeout(() => laserLine.material.opacity = 0, 150);
+
+            // Raycast for hits
+            raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+            
+            // Get all meshes inside all mob groups
+            let hitTargets = [];
+            mobs.forEach(m => hitTargets.push(...m.children));
+            
+            const intersects = raycaster.intersectObjects(hitTargets, false);
+            
+            if (intersects.length > 0) {
+                let hitMesh = intersects[0].object;
+                let mobGroup = hitMesh.parent;
+                mobGroup.stunUntil = performance.now() + 3000; // Stun for 3 seconds
+                
+                // Visual feedback (Turn white briefly)
+                let oldColor = hitMesh.material.color.getHex();
+                hitMesh.material.color.setHex(0xffffff);
+                setTimeout(() => hitMesh.material.color.setHex(oldColor), 200);
+            }
+        }
+
+        // --- UTILS ---
+        function createNoiseTexture(color1, color2) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256; canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = color1; ctx.fillRect(0, 0, 256, 256);
+            ctx.fillStyle = color2;
+            for (let i = 0; i < 15000; i++) {
+                let x = Math.random() * 256, y = Math.random() * 256;
+                let size = Math.random() * 2 + 1;
+                ctx.globalAlpha = Math.random() * 0.5;
+                ctx.fillRect(x, y, size, size);
+            }
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.wrapS = THREE.RepeatWrapping; texture.wrapT = THREE.RepeatWrapping;
+            return texture;
+        }
+
+        function onKeyDown(event) {
+            switch (event.code) {
+                case 'ArrowUp': case 'KeyW': moveForward = true; break;
+                case 'ArrowLeft': case 'KeyA': moveLeft = true; break;
+                case 'ArrowDown': case 'KeyS': moveBackward = true; break;
+                case 'ArrowRight': case 'KeyD': moveRight = true; break;
+                case 'ShiftLeft': case 'ShiftRight': isSprinting = true; break;
+                case 'Space': moveUp = true; break;
+                case 'ControlLeft': moveDown = true; break;
+                case 'KeyF': 
+                    isFlying = !isFlying; 
+                    camera.position.y = isFlying ? 3.0 : 1.6;
+                    break;
+                case 'KeyT': toggleMonsterHighlight(); break;
+            }
+        }
+
+        function onKeyUp(event) {
+            switch (event.code) {
+                case 'ArrowUp': case 'KeyW': moveForward = false; break;
+                case 'ArrowLeft': case 'KeyA': moveLeft = false; break;
+                case 'ArrowDown': case 'KeyS': moveBackward = false; break;
+                case 'ArrowRight': case 'KeyD': moveRight = false; break;
+                case 'ShiftLeft': case 'ShiftRight': isSprinting = false; break;
+                case 'Space': moveUp = false; break;
+                case 'ControlLeft': moveDown = false; break;
+            }
+        }
+
+        function onMouseMove(event) {
+            if (document.pointerLockElement !== blocker) return;
+            euler.setFromQuaternion(camera.quaternion);
+            euler.y -= (event.movementX || 0) * 0.0025;
+            euler.x -= (event.movementY || 0) * 0.0025;
+            euler.x = Math.max(-Math.PI / 2.2, Math.min(Math.PI / 2.2, euler.x));
+            camera.quaternion.setFromEuler(euler);
+        }
+
+        function toggleMonsterHighlight() {
+            isMonsterHighlighted = !isMonsterHighlighted;
+            mobs.forEach(monster => {
+                monster.traverse((child) => {
+                    if (child.isMesh) {
+                        child.material.color.setHex(isMonsterHighlighted ? 0xff0000 : 0x111111);
+                        child.material.depthTest = !isMonsterHighlighted;
+                        child.renderOrder = isMonsterHighlighted ? 999 : 0;
+                    }
+                });
+            });
+        }
+
+        function checkWallCollision(newPos) {
+            if(isFlying) return false; // Noclip!
+            const buffer = 0.5; 
+            for(let i = 0; i < walls.length; i++) {
+                const w = walls[i].position;
+                if (newPos.x > w.x - UNIT_SIZE/2 - buffer && newPos.x < w.x + UNIT_SIZE/2 + buffer &&
+                    newPos.z > w.z - UNIT_SIZE/2 - buffer && newPos.z < w.z + UNIT_SIZE/2 + buffer) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // --- MAIN LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+            if (isGameOver) return;
+
+            const time = performance.now();
+            const delta = (time - prevTime) / 1000;
+            prevTime = time;
+
+            camera.getWorldDirection(camDir);
+            flashlight.position.copy(camera.position);
+            flashlight.target.position.copy(camera.position).add(camDir);
+
+            // Movement Logic
+            const baseSpeed = isSprinting ? 9.0 : 4.5;
+            const moveSpeed = baseSpeed * delta;
+            const moveVec = new THREE.Vector3(0, 0, 0);
+            
+            if (moveForward) moveVec.z -= 1;
+            if (moveBackward) moveVec.z += 1;
+            if (moveLeft) moveVec.x -= 1;
+            if (moveRight) moveVec.x += 1;
+
+            if (moveVec.lengthSq() > 0) {
+                moveVec.normalize().multiplyScalar(moveSpeed);
+                moveVec.applyEuler(new THREE.Euler(0, euler.y, 0, 'YXZ'));
+
+                const nextX = camera.position.clone(); nextX.x += moveVec.x;
+                if (!checkWallCollision(nextX)) camera.position.x = nextX.x;
+
+                const nextZ = camera.position.clone(); nextZ.z += moveVec.z;
+                if (!checkWallCollision(nextZ)) camera.position.z = nextZ.z;
+            }
+
+            // Fly logic
+            if (isFlying) {
+                if(moveUp) camera.position.y += moveSpeed;
+                if(moveDown) camera.position.y -= moveSpeed;
+            } else {
+                camera.position.y = 1.6; // Lock height to walk
+            }
+
+            // Level Exit Check
+            if (exitPortal && Math.hypot(camera.position.x - exitPortal.position.x, camera.position.z - exitPortal.position.z) < UNIT_SIZE) {
+                loadLevel();
+            }
+
+            // Mobs AI
+            mobs.forEach(monster => {
+                if(time > monster.stunUntil) { // Only move if not stunned
+                    monster.lookAt(camera.position.x, monster.position.y, camera.position.z);
+                    const monsterDir = new THREE.Vector3(camera.position.x - monster.position.x, 0, camera.position.z - monster.position.z);
+                    
+                    if(monsterDir.length() > 0.1 && !isFlying) { // Only chase if player is grounded
+                        monsterDir.normalize();
+                        let mSpeed = (2.5 + (currentLevel * 0.2)) * delta; // Faster each level
+                        
+                        // Basic collision so they don't clip walls perfectly, but let them ghost slightly to prevent stuck
+                        monster.position.add(monsterDir.multiplyScalar(mSpeed));
+                    }
+                }
+
+                // Jumpscare Hitbox
+                if (!isFlying && Math.hypot(camera.position.x - monster.position.x, camera.position.z - monster.position.z) < 1.2) {
+                    isGameOver = true;
+                    document.exitPointerLock();
+                    document.getElementById('jumpscare').style.display = 'flex';
+                    setTimeout(() => window.location.reload(), 3000);
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
